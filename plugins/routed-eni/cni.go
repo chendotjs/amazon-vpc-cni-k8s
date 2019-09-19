@@ -108,6 +108,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 	}
 
 	k8sArgs := K8sArgs{}
+	// 通过CNI_ARGS传递创建好的Pod的k8s信息，如name、namespace等
 	if err := cniTypes.LoadArgs(args.Args, &k8sArgs); err != nil {
 		log.Errorf("Failed to load k8s config from arg: %v", err)
 		return errors.Wrap(err, "add cmd: failed to load k8s config from arg")
@@ -117,7 +118,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 	if conf.VethPrefix == "" {
 		conf.VethPrefix = "eni"
 	}
-	if len(conf.VethPrefix) > 4 {
+	if len(conf.VethPrefix) > 4 { // linux interface的长度不能超多15，后面取11位hash，所以这里不能大于4
 		return errors.New("conf.VethPrefix can be at most 4 characters long")
 	}
 
@@ -137,6 +138,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 
 	c := rpcClient.NewCNIBackendClient(conn)
 
+	// rpc调用IPAMD，netns和ifname通过CNI_NETNS、CNI_IFNAME获得，其他通过CNI_ARGS获得（之前LoadArgs解析过）
 	r, err := c.AddNetwork(context.Background(),
 		&pb.AddNetworkRequest{
 			Netns:                      args.Netns,
@@ -145,6 +147,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 			K8S_POD_INFRA_CONTAINER_ID: string(k8sArgs.K8S_POD_INFRA_CONTAINER_ID),
 			IfName:                     args.IfName})
 
+	// rpc调用错误
 	if err != nil {
 		log.Errorf("Error received from AddNetwork grpc call for pod %s namespace %s container %s: %v",
 			string(k8sArgs.K8S_POD_NAME),
@@ -154,6 +157,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 		return err
 	}
 
+	// rpc调用成功，但这里分配IP出现失败
 	if !r.Success {
 		log.Errorf("Failed to assign an IP address to pod %s, namespace %s container %s",
 			string(k8sArgs.K8S_POD_NAME),
@@ -166,6 +170,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 		string(k8sArgs.K8S_POD_NAME), string(k8sArgs.K8S_POD_NAMESPACE), string(k8sArgs.K8S_POD_INFRA_CONTAINER_ID),
 		r.IPv4Addr, r.DeviceNumber, r.UseExternalSNAT, r.VPCcidrs)
 
+	// IPAMD分配给Pod的IP
 	addr := &net.IPNet{
 		IP:   net.ParseIP(r.IPv4Addr),
 		Mask: net.IPv4Mask(255, 255, 255, 255),
@@ -175,8 +180,11 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 	// Note: the maximum length for linux interface name is 15
 	hostVethName := generateHostVethName(conf.VethPrefix, string(k8sArgs.K8S_POD_NAMESPACE), string(k8sArgs.K8S_POD_NAME))
 
+	// AddNetworkReply.DeviceNumber的唯一性保证了可以当作策略路由的table id
+	// SetupNS：添加网络设备、IP和路由表
 	err = driverClient.SetupNS(hostVethName, args.IfName, args.Netns, addr, int(r.DeviceNumber), r.VPCcidrs, r.UseExternalSNAT)
 
+	// 分配IP成功后配置容器网络环境错误，退还IP
 	if err != nil {
 		log.Errorf("Failed SetupPodNetwork for pod %s namespace %s container %s: %v",
 			string(k8sArgs.K8S_POD_NAME), string(k8sArgs.K8S_POD_NAMESPACE), string(k8sArgs.K8S_POD_INFRA_CONTAINER_ID), err)
@@ -202,6 +210,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 		return errors.Wrap(err, "add command: failed to setup network")
 	}
 
+	// 组装current.Result
 	ips := []*current.IPConfig{
 		{
 			Version: "4",
@@ -217,6 +226,7 @@ func add(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 }
 
 // generateHostVethName returns a name to be used on the host-side veth device.
+// rootns中的hostVeth名字只由Pod的name和namespace决定
 func generateHostVethName(prefix, namespace, podname string) string {
 	h := sha1.New()
 	h.Write([]byte(fmt.Sprintf("%s.%s", namespace, podname)))
@@ -261,6 +271,7 @@ func del(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 
 	c := rpcClient.NewCNIBackendClient(conn)
 
+	// rpc调用IPAMD，待删除的IPv4Addr及其他参数通过CNI_ARGS获得（之前LoadArgs解析过）
 	r, err := c.DelNetwork(context.Background(),
 		&pb.DelNetworkRequest{
 			K8S_POD_NAME:               string(k8sArgs.K8S_POD_NAME),
@@ -281,6 +292,7 @@ func del(args *skel.CmdArgs, cniTypes typeswrapper.CNITYPES, grpcClient grpcwrap
 		return errors.New("del cmd: failed to process delete request")
 	}
 
+	// 待删除的PodIP
 	addr := &net.IPNet{
 		IP:   net.ParseIP(r.IPv4Addr),
 		Mask: net.IPv4Mask(255, 255, 255, 255),

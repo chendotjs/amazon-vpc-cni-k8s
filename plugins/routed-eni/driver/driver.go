@@ -64,12 +64,13 @@ func New() NetworkAPIs {
 
 // createVethPairContext wraps the parameters and the method to create the
 // veth pair to attach the container namespace
+// 创建veth pair需要hostveth和contveth以及contveth的IP地址
 type createVethPairContext struct {
 	contVethName string
 	hostVethName string
 	addr         *net.IPNet
-	netLink      netlinkwrapper.NetLink
-	ip           ipwrapper.IP
+	netLink      netlinkwrapper.NetLink // vishvananda的netlink
+	ip           ipwrapper.IP // 设置默认路由
 }
 
 func newCreateVethPairContext(contVethName string, hostVethName string, addr *net.IPNet) *createVethPairContext {
@@ -84,6 +85,8 @@ func newCreateVethPairContext(contVethName string, hostVethName string, addr *ne
 
 // run defines the closure to execute within the container's namespace to
 // create the veth pair
+// 创建veth pair，设置路由规则，并将host veth放到rootns中
+// 这个函数会在pod的netns中执行
 func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
@@ -94,10 +97,12 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		PeerName: createVethContext.hostVethName,
 	}
 
+	// 创建veth设备对
 	if err := createVethContext.netLink.LinkAdd(veth); err != nil {
 		return err
 	}
 
+	// 检查hostveth
 	hostVeth, err := createVethContext.netLink.LinkByName(createVethContext.hostVethName)
 	if err != nil {
 		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.hostVethName)
@@ -109,6 +114,7 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		return errors.Wrapf(err, "setup NS network: failed to set link %q up", createVethContext.hostVethName)
 	}
 
+	// 检查contveth
 	contVeth, err := createVethContext.netLink.LinkByName(createVethContext.contVethName)
 	if err != nil {
 		return errors.Wrapf(err, "setup NS network: failed to find link %q", createVethContext.contVethName)
@@ -127,25 +133,32 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 	gw := net.IPv4(169, 254, 1, 1)
 	gwNet := &net.IPNet{IP: gw, Mask: net.CIDRMask(32, 32)}
 
+	// 添加静态路由 ip route add 169.254.1.1/32 dev eth0 scope link
+	// man ip-link 说：
+	// the scope of the destinations covered by the route prefix.  SCOPE_VAL may be a number or a string from the file /etc/iproute2/rt_scopes.  If this parameter is omitted, ip assumes scope global for all gatewayed unicast routes, scope link for
+	//                     direct unicast and broadcast routes and scope host for local routes.
 	if err = createVethContext.netLink.RouteReplace(&netlink.Route{
 		LinkIndex: contVeth.Attrs().Index,
-		Scope:     netlink.SCOPE_LINK,
+		Scope:     netlink.SCOPE_LINK, // TODO: hostveth和contveth直连，所以用SCOPE_LINK？对比ip.AddHostRoute和ip.AddRoute
 		Dst:       gwNet}); err != nil {
 		return errors.Wrap(err, "setup NS network: failed to add default gateway")
 	}
 
 	// Add a default route via dummy next hop(169.254.1.1). Then all outgoing traffic will be routed by this
 	// default route via dummy next hop (169.254.1.1).
+	// 添加默认路由 ip route add default via 169.254.1.1 dev eth0
 	if err = createVethContext.ip.AddDefaultRoute(gwNet.IP, contVeth); err != nil {
 		return errors.Wrap(err, "setup NS network: failed to add default route")
 	}
 
+	// 设置contveth的IP地址，这里的IP由IPAMD传来
 	if err = createVethContext.netLink.AddrAdd(contVeth, &netlink.Addr{IPNet: createVethContext.addr}); err != nil {
 		return errors.Wrapf(err, "setup NS network: failed to add IP addr to %q", createVethContext.contVethName)
 	}
 
 	// add static ARP entry for default gateway
 	// we are using routed mode on the host and container need this static ARP entry to resolve its default gateway.
+	// 效果类似 arp -s 169.254.1.1 hsotveth.mac
 	neigh := &netlink.Neigh{
 		LinkIndex:    contVeth.Attrs().Index,
 		State:        netlink.NUD_PERMANENT,
@@ -153,12 +166,14 @@ func (createVethContext *createVethPairContext) run(hostNS ns.NetNS) error {
 		HardwareAddr: hostVeth.Attrs().HardwareAddr,
 	}
 
+	// ip neighbor del 169.254.1.1 lladdr hsotveth.mac dev eth0 nud permanent
 	if err = createVethContext.netLink.NeighAdd(neigh); err != nil {
 		return errors.Wrap(err, "setup NS network: failed to add static ARP")
 	}
 
 	// Now that the everything has been successfully set up in the container, move the "host" end of the
 	// veth into the host namespace.
+	// 移veth到rootns
 	if err = createVethContext.netLink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
 		return errors.Wrap(err, "setup NS network: failed to move veth to host netns")
 	}
@@ -174,6 +189,7 @@ func (os *linuxNetwork) SetupNS(hostVethName string, contVethName string, netnsP
 func setupNS(hostVethName string, contVethName string, netnsPath string, addr *net.IPNet, table int, vpcCIDRs []string, useExternalSNAT bool,
 	netLink netlinkwrapper.NetLink, ns nswrapper.NS) error {
 	// Clean up if hostVeth exists.
+	// 如果rootns存在同一个container遗留的veth就删掉
 	if oldHostVeth, err := netLink.LinkByName(hostVethName); err == nil {
 		if err = netLink.LinkDel(oldHostVeth); err != nil {
 			return errors.Wrapf(err, "setupNS network: failed to delete old hostVeth %q", hostVethName)
@@ -182,6 +198,7 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 	}
 
 	createVethContext := newCreateVethPairContext(contVethName, hostVethName, addr)
+	// 在Pod netns中创建veth pair，设置Pod eth0的IP以及网关路由规则，并将host veth放到rootns中
 	if err := ns.WithNetNSPath(netnsPath, createVethContext.run); err != nil {
 		log.Errorf("Failed to setup NS network %v", err)
 		return errors.Wrap(err, "setupNS network: failed to setup NS network")
@@ -210,11 +227,13 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 		Dst:       addrHostAddr}
 
 	// Add or replace route
+	// 设置 ip route replace `PodIP` dev `hostveth` scope link
 	if err := netLink.RouteReplace(&route); err != nil {
 		return errors.Wrapf(err, "setupNS: unable to add or replace route entry for %s", route.Dst.IP.String())
 	}
 	log.Debugf("Successfully set host route to be %s/0", route.Dst.IP.String())
 
+	// 设置：ip rule add to `PodIP` lookup main prio 512
 	toContainerFlag := true
 	err = addContainerRule(netLink, toContainerFlag, addr, toContainerRulePriority, mainRouteTable)
 
@@ -229,6 +248,8 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 	if table > 0 {
 		if useExternalSNAT {
 			// add rule: 1536: from <podIP> use table <table>
+			// 每个eni都有一个唯一的table
+			// 设置：ip rule add from `PodIP` lookup `eni-table` prio 1536
 			toContainerFlag = false
 			err = addContainerRule(netLink, toContainerFlag, addr, fromContainerRulePriority, table)
 
@@ -267,22 +288,26 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 	return nil
 }
 
+// addr传递进来的是PodIP
 func addContainerRule(netLink netlinkwrapper.NetLink, isToContainer bool, addr *net.IPNet, priority int, table int) error {
 	containerRule := netLink.NewRule()
 
+	// containerRule的Dst和Src决定了table的条件（from或to）
 	if isToContainer {
-		containerRule.Dst = addr
+		containerRule.Dst = addr // ip rule add from all to `addr` lookup `table` prio `xxx`
 	} else {
-		containerRule.Src = addr
+		containerRule.Src = addr // ip rule add from `addr` lookup `table` prio `xxx`
 	}
 	containerRule.Table = table
 	containerRule.Priority = priority
 
+	// 清理旧策略规则 设置 ip rule del
 	err := netLink.RuleDel(containerRule)
 	if err != nil && !containsNoSuchRule(err) {
 		return errors.Wrapf(err, "addContainerRule: failed to delete old container rule for %s", addr.String())
 	}
 
+	// 设置 ip rule add ... dev  `table` prio `xxx`
 	err = netLink.RuleAdd(containerRule)
 	if err != nil {
 		return errors.Wrapf(err, "addContainerRule: failed to add container rule for %s", addr.String())
@@ -296,8 +321,10 @@ func (os *linuxNetwork) TeardownNS(addr *net.IPNet, table int) error {
 	return tearDownNS(addr, table, os.netLink)
 }
 
+// addr为待删除的PodIP
 func tearDownNS(addr *net.IPNet, table int, netLink netlinkwrapper.NetLink) error {
 	// remove to-pod rule
+	// 设置 ip rule del to `PodIP` (table main) prio 512
 	toContainerRule := netLink.NewRule()
 	toContainerRule.Dst = addr
 	toContainerRule.Priority = toContainerRulePriority
@@ -311,6 +338,7 @@ func tearDownNS(addr *net.IPNet, table int, netLink netlinkwrapper.NetLink) erro
 
 	if table > 0 {
 		// remove from-pod rule only for non main table
+		// 设置 ip rule del from `PodIP`
 		err := deleteRuleListBySrc(*addr)
 		if err != nil {
 			log.Errorf("Failed to delete fromContainer for %s %v", addr.String(), err)
@@ -324,6 +352,7 @@ func tearDownNS(addr *net.IPNet, table int, netLink netlinkwrapper.NetLink) erro
 		Mask: net.CIDRMask(32, 32)}
 
 	// cleanup host route:
+	// 设置 ip route del `PodIP`
 	if err = netLink.RouteDel(&netlink.Route{
 		Scope: netlink.SCOPE_LINK,
 		Dst:   addrHostAddr}); err != nil {
@@ -331,7 +360,7 @@ func tearDownNS(addr *net.IPNet, table int, netLink netlinkwrapper.NetLink) erro
 	}
 	return nil
 }
-
+// deleteRuleListBySrc 删除源地址为src的所有rule
 func deleteRuleListBySrc(src net.IPNet) error {
 	networkClient := networkutils.New()
 	return networkClient.DeleteRuleListBySrc(src)

@@ -17,7 +17,7 @@ message AddNetworkRequest {
 }
 
 message  AddNetworkReply{
-  bool Success = 1;
+  bool Success = 1; // Success字段表示连接IPAMD后的调用结果是否成功
   string IPv4Addr = 2;
   string IPv4Subnet = 3;
   int32 DeviceNumber = 4;
