@@ -246,6 +246,7 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 
 	// add from-pod rule, only need it when it is not primary ENI
 	if table > 0 {
+		// useExternalSNAT默认为false
 		if useExternalSNAT {
 			// add rule: 1536: from <podIP> use table <table>
 			// 每个eni都有一个唯一的table
@@ -260,6 +261,7 @@ func setupNS(hostVethName string, contVethName string, netnsPath string, addr *n
 			log.Infof("Added rule priority %d from %s table %d", fromContainerRulePriority, addr.String(), table)
 		} else {
 			// add rule: 1536: list of from <podIP> to <vpcCIDR> use table <table>
+			// 设置 ip rule add from `PodIP` to `vpcCIDR` table `eni-table` prio 1536
 			for _, cidr := range vpcCIDRs {
 				podRule := netLink.NewRule()
 				_, podRule.Dst, _ = net.ParseCIDR(cidr)

@@ -90,6 +90,8 @@ func _main() int {
 	}
 
 	// Start the RPC listener
+	// 启动grpc server(包括health和cni-backend)
+	// RegisterCNIBackendServer接收cni发来的请求: AddNetwork DelNetwork Check
 	err = ipamContext.RunRPCHandler()
 	if err != nil {
 		log.Errorf("Failed to set up gRPC handler: %v", err)

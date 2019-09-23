@@ -244,6 +244,7 @@ func New(k8sapiClient k8sapi.K8SAPIs, eniConfig *eniconfig.ENIConfigController) 
 }
 
 //TODO need to break this function down(comments from CR)
+// ipamd启动时会执行 New() -> nodeInit()
 func (c *IPAMContext) nodeInit() error {
 	ipamdActionsInprogress.WithLabelValues("nodeInit").Add(float64(1))
 	defer ipamdActionsInprogress.WithLabelValues("nodeInit").Sub(float64(1))
@@ -251,6 +252,7 @@ func (c *IPAMContext) nodeInit() error {
 
 	log.Debugf("Start node init")
 
+	// 获得节点最大的ENI数目
 	c.maxENI, err = c.getMaxENI()
 	if err != nil {
 		log.Error("Failed to get ENI limit")
@@ -258,6 +260,7 @@ func (c *IPAMContext) nodeInit() error {
 	}
 	enisMax.Set(float64(c.maxENI))
 
+	// 获得每个ENI最大的IP数目
 	c.maxIPsPerENI, err = c.awsClient.GetENIipLimit()
 	if err != nil {
 		log.Error("Failed to get IPs per ENI limit")
@@ -295,6 +298,7 @@ func (c *IPAMContext) nodeInit() error {
 		retry := 0
 		for {
 			retry++
+			// 根据ENI信息重新填充datastore，这样的在下面为每个Pod添加IP时候可以恢复datastore中Pod与IP的绑定关系
 			err = c.setupENI(eni.ENIID, eni)
 			if retry > maxRetryCheckENI {
 				log.Errorf("Unable to discover attached IPs for ENI from metadata service")
@@ -343,6 +347,7 @@ func (c *IPAMContext) nodeInit() error {
 			continue
 		}
 		log.Infof("Recovered AddNetwork for Pod %s, Namespace %s, Container %s", ip.Name, ip.Namespace, ip.Container)
+		// !!!!在这里恢复IPAM退出后的datastore状态
 		_, _, err = c.dataStore.AssignPodIPv4Address(ip)
 		if err != nil {
 			ipamdErrInc("nodeInitAssignPodIPv4AddressFailed")
@@ -676,12 +681,13 @@ func (c *IPAMContext) tryAssignIPs() (increasedPool bool, err error) {
 	return false, nil
 }
 
+// 在ipam重启的情况下很重要，会在启动时重新填充datastore
 // setupENI does following:
 // 1) add ENI to datastore
 // 2) set up linux ENI related networking stack.
 // 3) add all ENI's secondary IP addresses to datastore
 func (c *IPAMContext) setupENI(eni string, eniMetadata awsutils.ENIMetadata) error {
-	ec2Addrs, eniPrimaryIP, err := c.getENIaddresses(eni)
+	ec2Addrs, eniPrimaryIP, err := c.getENIaddresses(eni) // 获取eni所有的IP地址和主IP
 	if err != nil {
 		return errors.Wrapf(err, "failed to retrieve ENI %s IP addresses", eni)
 	}

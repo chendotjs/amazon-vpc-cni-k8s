@@ -82,6 +82,7 @@ var (
 )
 
 // ENIIPPool contains ENI/IP Pool information. Exported fields will be marshaled for introspection.
+// ENIIPPool 描述了一个ENI及其所拥有的IP
 type ENIIPPool struct {
 	createTime         time.Time
 	lastUnassignedTime time.Time
@@ -121,10 +122,10 @@ type PodIPInfo struct {
 
 // DataStore contains node level ENI/IP
 type DataStore struct {
-	total      int
-	assigned   int
-	eniIPPools map[string]*ENIIPPool
-	podsIP     map[PodKey]PodIPInfo
+	total      int // 节点层面所有的IP个数
+	assigned   int // 节点层面已经分配的IP个数
+	eniIPPools map[string]*ENIIPPool // ENI IP池，一个Node可能有多个ENI， key是eniID
+	podsIP     map[PodKey]PodIPInfo // Pod与IP的对应关系
 	lock       sync.RWMutex
 }
 
@@ -166,6 +167,7 @@ func (ds *DataStore) AddENI(eniID string, deviceNumber int, isPrimary bool) erro
 
 	log.Debug("DataStore Add an ENI ", eniID)
 
+	// 检查eniID是否存在
 	_, ok := ds.eniIPPools[eniID]
 	if ok {
 		return errors.New(DuplicatedENIError)
@@ -232,7 +234,7 @@ func (ds *DataStore) DelIPv4AddressFromStore(eniID string, ipv4 string) error {
 	// Prometheus gauge
 	totalIPs.Set(float64(ds.total))
 
-	delete(curENI.IPv4Addresses, ipv4)
+	delete(curENI.IPv4Addresses, ipv4) // 从ENIIPPool中删除
 
 	log.Infof("Deleted ENI(%s)'s IP %s from datastore", eniID, ipv4)
 	return nil
@@ -252,7 +254,7 @@ func (ds *DataStore) AssignPodIPv4Address(k8sPod *k8sapi.K8SPodInfo) (string, in
 	}
 	ipAddr, ok := ds.podsIP[podKey]
 	if ok {
-		if ipAddr.IP == k8sPod.IP && k8sPod.IP != "" {
+		if ipAddr.IP == k8sPod.IP && k8sPod.IP != "" { // Pod已经有了相同的IP
 			// The caller invoke multiple times to assign(PodName/NameSpace --> same IPAddress). It is not a error, but not very efficient.
 			log.Infof("AssignPodIPv4Address: duplicate pod assign for IP %s, name %s, namespace %s, container %s",
 				k8sPod.IP, k8sPod.Name, k8sPod.Namespace, k8sPod.Container)
@@ -276,13 +278,16 @@ func (ds *DataStore) assignPodIPv4AddressUnsafe(k8sPod *k8sapi.K8SPodInfo) (stri
 	}
 	curTime := time.Now()
 	for _, eni := range ds.eniIPPools {
-		if (k8sPod.IP == "") && (len(eni.IPv4Addresses) == eni.AssignedIPv4Addresses) {
+		if (k8sPod.IP == "") && (len(eni.IPv4Addresses) == eni.AssignedIPv4Addresses) { // 已分配给Pod的IP和eni所拥有的IP数目相同，说明没有可用的
 			// skip this ENI, since it has no available IP addresses
 			log.Debugf("AssignPodIPv4Address: Skip ENI %s that does not have available addresses", eni.ID)
 			continue
 		}
+
+		// 这里已经找到一个可用的eni了
 		for _, addr := range eni.IPv4Addresses {
 			if k8sPod.IP == addr.Address {
+				// Pod已有的IP和eni中的IP相同，说明在IPAM重启后分配信息已丢失，需要把这个IP重新分配给Pod
 				// After L-IPAM restart and built IP warm-pool, it needs to take the existing running pod IP out of the pool.
 				if !addr.Assigned {
 					incrementAssignedCount(ds, eni, addr)
@@ -292,6 +297,8 @@ func (ds *DataStore) assignPodIPv4AddressUnsafe(k8sPod *k8sapi.K8SPodInfo) (stri
 				ds.podsIP[podKey] = PodIPInfo{IP: addr.Address, DeviceNumber: eni.DeviceNumber}
 				return addr.Address, eni.DeviceNumber, nil
 			}
+
+			// 这里是正常情况下的IP分配, Pod没有IP
 			if !addr.Assigned && k8sPod.IP == "" && curTime.Sub(addr.UnassignedTime) > addressCoolingPeriod {
 				// This is triggered by a pod's Add Network command from CNI plugin
 				incrementAssignedCount(ds, eni, addr)
@@ -319,6 +326,8 @@ func (ds *DataStore) GetStats() (int, int) {
 	return ds.total, ds.assigned
 }
 
+// 判定除了这个eni，其他eni能否提供足够的warm IP
+// 在getDeletableENI被调用
 // IsRequiredForWarmIPTarget determines if this ENI has warm IPs that are required to fulfill whatever WARM_IP_TARGET is
 // set to.
 func (ds *DataStore) isRequiredForWarmIPTarget(warmIPTarget int, eni *ENIIPPool) bool {
@@ -331,6 +340,7 @@ func (ds *DataStore) isRequiredForWarmIPTarget(warmIPTarget int, eni *ENIIPPool)
 	return otherWarmIPs < warmIPTarget
 }
 
+// 找到一个可以被删除的eni
 func (ds *DataStore) getDeletableENI(warmIPTarget int) *ENIIPPool {
 	for _, eni := range ds.eniIPPools {
 		if eni.IsPrimary {
@@ -466,6 +476,7 @@ func (ds *DataStore) UnassignPodIPv4Address(k8sPod *k8sapi.K8SPodInfo) (string, 
 		return "", 0, ErrUnknownPod
 	}
 
+	// 找到包含IP的eni
 	for _, eni := range ds.eniIPPools {
 		ip, ok := eni.IPv4Addresses[ipAddr.IP]
 		if ok && ip.Assigned {

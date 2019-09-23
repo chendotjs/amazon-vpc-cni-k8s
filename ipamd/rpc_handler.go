@@ -50,17 +50,20 @@ func (s *server) AddNetwork(ctx context.Context, in *pb.AddNetworkRequest) (*pb.
 	log.Infof("Received AddNetwork for NS %s, Pod %s, NameSpace %s, Container %s, ifname %s",
 		in.Netns, in.K8S_POD_NAME, in.K8S_POD_NAMESPACE, in.K8S_POD_INFRA_CONTAINER_ID, in.IfName)
 
+	// 在datastore中根据PodInfo分配IP地址
 	addr, deviceNumber, err := s.ipamContext.dataStore.AssignPodIPv4Address(&k8sapi.K8SPodInfo{
 		Name:      in.K8S_POD_NAME,
 		Namespace: in.K8S_POD_NAMESPACE,
 		Container: in.K8S_POD_INFRA_CONTAINER_ID})
 
+	// 通过aws sdk查询vpcCIDR
 	var pbVPCcidrs []string
 	for _, cidr := range s.ipamContext.awsClient.GetVPCIPv4CIDRs() {
 		log.Debugf("VPC CIDR %s", *cidr)
 		pbVPCcidrs = append(pbVPCcidrs, *cidr)
 	}
 
+	// 如果不用ExternalSNAT，也要添加从环境变量获得的AWS_VPC_K8S_CNI_EXCLUDE_SNAT_CIDRS
 	useExternalSNAT := s.ipamContext.networkClient.UseExternalSNAT()
 	if !useExternalSNAT {
 		for _, cidr := range s.ipamContext.networkClient.GetExcludeSNATCIDRs() {
